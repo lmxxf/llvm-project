@@ -29,11 +29,19 @@
 #include "llvm/CodeGen/MachineOperand.h"
 #include "llvm/CodeGen/MachinePassManager.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/CommandLine.h"
 
 #define DEBUG_TYPE "gcn-create-vopd"
 STATISTIC(NumVOPDCreated, "Number of VOPD Insts Created.");
 
 using namespace llvm;
+
+// Experimental local post-RA repair for the gfx12 inference pipeline. Keep the
+// generic compiler unchanged unless the module build explicitly opts in.
+static cl::opt<unsigned> DLSS5VOPDLookahead(
+    "amdgpu-dlss5-vopd-lookahead", cl::Hidden, cl::init(0),
+    cl::desc("Search up to N nearby instructions for independent gfx1200/1201 "
+             "VOPD partners (0 preserves the normal adjacent-only pass)"));
 
 namespace {
 
@@ -53,6 +61,48 @@ private:
 
 public:
   const GCNSubtarget *ST = nullptr;
+
+  // Move a later VALU instruction earlier only over ordinary, independent
+  // register operations. Do not cross memory, matrix, MODE, EXEC changes,
+  // inline assembly, bundles, or synchronization. Register queries include
+  // implicit operands and physical subregister aliases.
+  bool isOrdinaryRegisterOp(const SIInstrInfo &SII,
+                            const MachineInstr &Crossed) const {
+    if (Crossed.isMetaInstruction() || Crossed.isInlineAsm() ||
+        Crossed.isBundle() || Crossed.isBundled() ||
+        Crossed.isTerminator() || Crossed.isCall() ||
+        Crossed.mayLoadOrStore() || Crossed.hasUnmodeledSideEffects() ||
+        SII.isWMMA(Crossed) || SII.isMFMA(Crossed) ||
+        (!SII.isSALU(Crossed) && !SII.isVALU(Crossed)))
+      return false;
+    StringRef Name = SII.getName(Crossed.getOpcode());
+    if (Name.starts_with("S_GETREG") || Name.starts_with("S_SETREG") ||
+        Name.starts_with("S_WAIT") || Name.starts_with("S_DELAY") ||
+        Name.starts_with("S_NOP") || Name.starts_with("S_BARRIER"))
+      return false;
+    bool HasDef = false;
+    for (const auto &Op : Crossed.operands())
+      HasDef |= Op.isReg() && Op.isDef() && Op.getReg();
+    return HasDef;
+  }
+
+  bool canCross(const SIInstrInfo &SII, const MachineInstr &Moving,
+                const MachineInstr &Crossed) const {
+    if (!isOrdinaryRegisterOp(SII, Crossed))
+      return false;
+
+    const TargetRegisterInfo *TRI = ST->getRegisterInfo();
+    for (const auto &Op : Moving.operands()) {
+      if (!Op.isReg() || !Op.getReg())
+        continue;
+      if (Op.isUse() && Crossed.modifiesRegister(Op.getReg(), TRI))
+        return false; // RAW, including implicit EXEC/MODE.
+      if (Op.isDef() && (Crossed.readsRegister(Op.getReg(), TRI) ||
+                         Crossed.modifiesRegister(Op.getReg(), TRI)))
+        return false; // WAR or WAW.
+    }
+    return true;
+  }
 
   bool doReplace(const SIInstrInfo *SII, VOPDCombineInfo &CI) {
     auto *FirstMI = CI.FirstMI;
@@ -137,6 +187,11 @@ public:
     bool Changed = false;
     unsigned EncodingFamily = AMDGPU::getVOPDEncodingFamily(*ST);
     bool HasVOPD3 = ST->hasVOPD3();
+    const unsigned Lookahead =
+        (ST->getCPU() == "gfx1200" || ST->getCPU() == "gfx1201") &&
+                !MF.getFunction().hasFnAttribute(Attribute::StrictFP)
+            ? DLSS5VOPDLookahead.getValue()
+            : 0;
 
     SmallVector<VOPDCombineInfo> ReplaceCandidates;
 
@@ -172,7 +227,41 @@ public:
                                                VOPD3);
         };
 
-        if (checkVOPD(false) || (HasVOPD3 && checkVOPD(true))) {
+        bool CanCombine = checkVOPD(false) || (HasVOPD3 && checkVOPD(true));
+        if (!CanCombine && Lookahead && !FirstMI->isBundled()) {
+          auto Candidate = std::next(MII);
+          for (unsigned Distance = 2;
+               Candidate != E && Distance <= Lookahead;
+               ++Candidate, ++Distance) {
+            auto *Later = &*Candidate;
+            // A barrier also bounds the search, rather than merely rejecting
+            // that particular possible partner.
+            if (!isOrdinaryRegisterOp(*SII, *std::prev(Candidate)))
+              break;
+            if (Later->isDebugInstr() || Later->isBundled())
+              break;
+            SecondMI = Later;
+            Opc2 = SecondMI->getOpcode();
+            if (!(checkVOPD(false) || (HasVOPD3 && checkVOPD(true))))
+              continue;
+            bool Independent = true;
+            for (auto I = MII; I != Candidate; ++I)
+              Independent &= canCross(*SII, *SecondMI, *I);
+            if (!Independent)
+              continue;
+
+            // The old kill markers describe the old order. Missing kills are
+            // safe here; retaining a moved last-use marker would be wrong.
+            for (auto &Op : SecondMI->operands())
+              if (Op.isReg() && Op.isUse())
+                Op.setIsKill(false);
+            MBB.splice(MII, &MBB, Candidate);
+            MII = SecondMI->getIterator();
+            CanCombine = true;
+            break;
+          }
+        }
+        if (CanCombine) {
           ReplaceCandidates.push_back(CI);
           ++MII;
         }

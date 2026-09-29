@@ -1,8 +1,8 @@
 # DLSS5 / gfx12 compiler branch
 
 This branch establishes an independently built AMDGPU compiler for the
-DLSSNR-on-RDNA4 project. It currently contains **no compiler optimization
-patches**.
+DLSSNR-on-RDNA4 project. The first experimental optimization is a default-off
+post-RA VOPD lookahead in `GCNCreateVOPD.cpp`.
 
 ## Baseline
 
@@ -36,9 +36,22 @@ results and per-kernel code/resource differences.
 
 ## First patch policy
 
-Initial candidates are documented, not implemented: provable min/max-to-med3
-folds, range-constrained corrected reciprocals, exact cast round-trips,
-restricted multiply-plus-zero contraction, VOPD pairing, and wait/MODE
-dependency handling. No blanket fast-math or silent change to rounding,
-non-finite values or signed zero is permitted. Each proposed patch needs a
-small semantic counterexample suite and full network validation.
+`-mllvm -amdgpu-dlss5-vopd-lookahead=4` searches for independent nearby VOPD
+partners on gfx1200/gfx1201 wave32 only. Default `0` preserves the ordinary
+adjacent-only pass. The opt-in pass stops at memory, WMMA/MFMA, inline assembly,
+bundles and synchronization, checks physical register aliases and implicit
+dependencies, and clears obsolete kill flags. The original downstream passes
+recompute waits and hazards. Strict-FP functions retain the original behavior.
+
+Two MIR/FileCheck tests cover the enable/disable and target gates, dependencies,
+aliasing, kill flags, boundaries and search distance. Default-off rebuilding
+matches all 60 previous public21 module code/metadata sections. Enabled modules
+pass all 168 EXACT/AE golden frames, with identical adaptive decisions.
+
+The 2026-09-29 measurements did **not** meet the 0.5% whole-network gate against
+the deployed driver compiler: 900p improved 0.15–0.36%, 1080p regressed
+0.03–0.15%. It remains an experimental switch, not a production default.
+[Evidence and reproduction](https://github.com/lmxxf/dlss5-on-amd-9070xt-porting/tree/main/Development/results/llvm-patch1-20260929).
+
+No blanket fast-math or silent change to rounding, non-finite values or signed
+zero is permitted. Existing source-level arithmetic workarounds were not changed.
